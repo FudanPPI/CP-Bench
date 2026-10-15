@@ -345,8 +345,12 @@ def _sweep_cross_gpu(args, preset=None):
     return 1 if overall_failed > 0 else 0
 
 
-def _run_self_mode(args):
-    """Run self-consistency testing on each GPU in parallel."""
+def _run_self_mode(args, fallback: bool = False):
+    """Run self-consistency testing on each GPU in parallel.
+
+    fallback=True marks results reached via the single-GPU fallback from
+    cross-gpu mode, so consumers can tell the detection semantics apart.
+    """
     from concurrent.futures import as_completed, ThreadPoolExecutor
 
     from .detector import GPUSDCDetector
@@ -431,6 +435,8 @@ def _run_self_mode(args):
                 )
 
     for r in all_results:
+        if fallback:
+            r["mode"] = "self-fallback-from-cross-gpu"
         print(f"\nResult (GPU {r['gpu_id']}): {r}")
 
     return overall_rc
@@ -470,9 +476,20 @@ def _run_cross_gpu_mode(args, preset=None):
         # Single-GPU platform (e.g. Grace Hopper GH200) — cross-GPU comparison
         # is impossible, fall back to self-consistency mode so the GPU still
         # gets tested and we don't pollute SDC metrics with false failures.
+        # State the detection-semantics change explicitly: replication plus
+        # the CPU-fp64 oracle replaces independent cross-GPU comparison, and
+        # replication alone is structurally blind to deterministic SDC.
+        if not args.run_oracle:
+            logger.warning(
+                "--no-oracle with a single GPU leaves ONLY replication: "
+                "deterministic SDC will NOT be detected. Cross-GPU "
+                "comparison requires 2+ GPUs; drop --no-oracle to enable "
+                "the CPU-fp64 oracle."
+            )
         logger.info(
             "Single GPU detected — falling back to self-consistency mode "
-            "(cross-GPU comparison requires 2+ GPUs)"
+            f"(replication + {'CPU-fp64 oracle' if args.run_oracle else 'NO oracle'}); "
+            "cross-GPU comparison requires 2+ GPUs"
         )
         # Apply preset-enhanced values so self-mode runs at the configured depth.
         args.iterations = iterations
@@ -482,7 +499,7 @@ def _run_cross_gpu_mode(args, preset=None):
             args.categories = ",".join(categories)
         args.hash_inputs = hash_inputs
         args.pipelines = run_pipelines
-        return _run_self_mode(args)
+        return _run_self_mode(args, fallback=True)
 
     dtypes = [d.strip() for d in args.dtypes.split(",")]
 
