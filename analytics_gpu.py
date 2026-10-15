@@ -101,17 +101,38 @@ def check_if_concurrent_perf_pass(lines, target_step_time, percentage_threshold)
                 )
 
 
+# Widened float grammar: the old [\d.]+ class silently dropped negative
+# values, scientific notation and inf/nan.  A dropped line would remove
+# that step from the SDC comparison and turn a real corruption into a
+# PASS, so parse failures must be counted and surfaced (fail-closed).
+_CHECKSUM_VALUE = (
+    r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?|[-+]?inf|nan"
+)
+_CHECKSUM_PATTERN = re.compile(
+    rf"Checksum at step (\d+): ({_CHECKSUM_VALUE}) at GPU rank (\d+)",
+    re.IGNORECASE,
+)
+_CHECKSUM_PROBE = re.compile(r"Checksum at step")
+
+
 def parse_checksums(file_lines):
-    """Parse checksum values from log lines."""
-    pattern = re.compile(r"Checksum at step (\d+): ([\d.]+) at GPU rank \d+")
+    """Parse checksum values from log lines.
+
+    Returns (checksums, n_unparsed), where n_unparsed counts lines that
+    look like checksum entries but failed to parse (log format drift).
+    """
     checksums = defaultdict(set)
+    n_unparsed = 0
     for line in file_lines:
-        match = pattern.search(line)
+        if not _CHECKSUM_PROBE.search(line):
+            continue
+        match = _CHECKSUM_PATTERN.search(line)
         if match:
             step = int(match.group(1))
-            checksum = float(match.group(2))
-            checksums[step].add(checksum)
-    return checksums
+            checksums[step].add(float(match.group(2)))
+        else:
+            n_unparsed += 1
+    return checksums, n_unparsed
 
 
 def check_if_distributed_sdc_pass(lines1, lines2):
@@ -120,36 +141,50 @@ def check_if_distributed_sdc_pass(lines1, lines2):
     print(
         "------ SDC test looks at if there is silent data corruption in the model running ----- "
     )
-    checksums1 = parse_checksums(lines1)
-    checksums2 = parse_checksums(lines2)
+    checksums1, unparsed1 = parse_checksums(lines1)
+    checksums2, unparsed2 = parse_checksums(lines2)
+    if unparsed1 or unparsed2:
+        print(
+            f"FAIL: {unparsed1 + unparsed2} checksum line(s) failed to parse "
+            "(log format drift?); the SDC verdict would not be trustworthy."
+        )
+        return False
     common_steps = set(checksums1.keys()).intersection(set(checksums2.keys()))
+    if not common_steps:
+        print(
+            "FAIL: no common checksum steps between the two logs; "
+            "nothing was compared."
+        )
+        return False
     for step in sorted(common_steps):
         if checksums1[step] == checksums2[step]:
             pass
         else:
             print(f"FAIL: Distributed SDC testing at step {step}.")
-            return
-    print("PASS: Distributed SDC testing.")
+            return False
+    print(f"PASS: Distributed SDC testing "
+          f"({len(common_steps)} step(s) compared).")
+    return True
 
 
 def check_if_concurrent_sdc_pass(lines):
     """Check if the checksum values at each step are the same across all GPU ranks."""
-    pattern = re.compile(r"Checksum at step (\d+): ([\d.]+) at GPU rank (\d+)")
-    checksums_by_step = defaultdict(set)
-    for line in lines:
-        match = pattern.search(line)
-        if match:
-            step = int(match.group(1))
-            checksum = float(match.group(2))
-            checksums_by_step[step].add(checksum)
+    checksums_by_step, n_unparsed = parse_checksums(lines)
+    if n_unparsed:
+        print(
+            f"FAIL: {n_unparsed} checksum line(s) failed to parse "
+            "(log format drift?); the SDC verdict would not be trustworthy."
+        )
+        return False
     for step, checksums in checksums_by_step.items():
         if len(checksums) == 1:
             pass  # Do nothing if checksums are consistent
         else:
             print(f"Step {step}: Checksum values are inconsistent across GPU ranks.")
             print("FAIL: Concurrent SDC testing.")
-            return
+            return False
     print("PASS: Concurrent SDC testing.")
+    return True
 
 
 def main(
