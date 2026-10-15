@@ -370,6 +370,9 @@ def _run_self_mode(args):
             gpu_id=gpu_id,
             num_iterations=args.iterations,
             test_sizes=test_sizes,
+            run_oracle=args.run_oracle,
+            oracle_rtol=args.oracle_rtol,
+            oracle_atol=args.oracle_atol,
         )
         try:
             result = detector.run_all_tests(
@@ -405,7 +408,7 @@ def _run_self_mode(args):
             print(f"ERROR on GPU {r['gpu_id']}: {r['error']}", file=sys.stderr)
             overall_rc = 1
         else:
-            if r["ops_failed"] > 0:
+            if r["ops_failed"] > 0 or r.get("deterministic_sdc", 0) > 0:
                 overall_rc = 1
 
     if len(gpu_ids) > 1:
@@ -416,10 +419,15 @@ def _run_self_mode(args):
             if "error" in r:
                 logger.error(f"  GPU {r['gpu_id']}: ERROR ({r['error']})")
             else:
-                status = "FAIL" if r["ops_failed"] > 0 else "PASS"
+                failed = (r["ops_failed"] > 0
+                          or r.get("deterministic_sdc", 0) > 0)
+                status = "FAIL" if failed else "PASS"
                 logger.info(
                     f"  GPU {r['gpu_id']}: {status} "
-                    f"({r['ops_passed']}/{r['ops_total']} passed)"
+                    f"({r['ops_passed']}/{r['ops_total']} passed, "
+                    f"non-det={r['ops_failed']}, "
+                    f"det-sdc={r.get('deterministic_sdc', 0)}, "
+                    f"oracle-unavail={r.get('oracle_unavailable', 0)})"
                 )
 
     for r in all_results:
@@ -565,7 +573,8 @@ examples:
   %(prog)s --preset thorough                           Full diagnosis + sweep (~25-30 min)
   %(prog)s --preset quick --fail-fast                  Stop on first failure
   %(prog)s --preset quick -v                           Full detail on failures
-  %(prog)s --mode self                                 Self-consistency, all GPUs
+  %(prog)s --mode self                                 Self-consistency + CPU-fp64 oracle, all GPUs
+  %(prog)s --mode self --no-oracle                     Replication only (misses deterministic SDC)
   %(prog)s --mode cross-gpu                            Cross-GPU, all GPUs
   %(prog)s --mode sweep                                Systematic full-HBM sweep
   %(prog)s --list-ops                                  List all registered ops
@@ -621,6 +630,30 @@ examples:
         action="store_true",
         default=False,
         help="Also run composite pipeline tests",
+    )
+
+    # Self-mode oracle (L2) configuration
+    parser.add_argument(
+        "--no-oracle",
+        dest="run_oracle",
+        action="store_false",
+        help="Self mode only: disable the CPU-fp64 oracle check and rely "
+        "on replication alone (replication cannot detect deterministic "
+        "SDC, only non-deterministic behavior)",
+    )
+    parser.add_argument(
+        "--oracle-rtol",
+        type=float,
+        default=1e-3,
+        help="Self mode only: relative tolerance for the CPU-fp64 oracle "
+        "(default: 1e-3)",
+    )
+    parser.add_argument(
+        "--oracle-atol",
+        type=float,
+        default=1e-3,
+        help="Self mode only: absolute tolerance for the CPU-fp64 oracle "
+        "(default: 1e-3)",
     )
 
     # Cross-GPU specific
