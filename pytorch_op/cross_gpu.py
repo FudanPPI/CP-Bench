@@ -22,6 +22,7 @@ from typing import Dict, List, Optional, Set, Tuple
 import torch
 
 from .ops import DTYPE_MAP, OP_REGISTRY, OpDef, PIPELINE_REGISTRY
+from .detector import _deterministic_rng
 from .precision import enable_deterministic_mode, resolve_dtype, set_precision_mode
 
 logger = logging.getLogger("pytorch_op_crossgpu")
@@ -127,11 +128,17 @@ class CrossGPUDetector:
         return serials
 
     def create_test_tensor(self, shape, dtype=None):
+        """Create a test tensor with a fixed, device-independent sequence.
+
+        Generated on the CPU and moved to the target device (fp32 draw,
+        then cast): peers consume bitwise-identical inputs by construction
+        instead of relying on cross-device Philox equality between
+        matching torch builds.  Must be called under _deterministic_rng.
+        """
         dtype = dtype or self.current_dtype
-        torch.manual_seed(42)
-        if dtype in (torch.float16, torch.bfloat16):
-            return torch.randn(shape, dtype=torch.float32, device=self.device).to(dtype)
-        return torch.randn(shape, dtype=dtype, device=self.device)
+        return torch.randn(shape, dtype=torch.float32, device="cpu").to(
+            dtype=dtype, device=self.device
+        )
 
     def _hash_tensor(self, t: torch.Tensor) -> str:
         """Compute a stable hash of a tensor's contents."""
@@ -145,26 +152,36 @@ class CrossGPUDetector:
         self.device = f"cuda:{gpu_id}"
         try:
             enable_deterministic_mode()
-            # Capture input tensor for hashing
-            torch.manual_seed(42)
-            input_tensor = self.create_test_tensor(size)
-            input_hash = self._hash_tensor(input_tensor) if self._hash_inputs else None
-            del input_tensor
+            # Single-source inputs: every random draw -- the hashed first
+            # tensor AND factory-internal weight/index/mask draws -- is
+            # generated on the CPU and moved to this GPU under one seed,
+            # so all peers consume bitwise-identical inputs by
+            # construction (closes D3's input premise; peers run
+            # sequentially, so the global CPU RNG is not raced).
+            with _deterministic_rng():
+                input_tensor = self.create_test_tensor(size)
+                input_hash = (
+                    self._hash_tensor(input_tensor)
+                    if self._hash_inputs
+                    else None
+                )
+                del input_tensor
 
-            # Re-seed and run the actual op with GPU timing
-            operation = op_def.factory(self, size)
-            with torch.cuda.device(gpu_id):
-                start_event = torch.cuda.Event(enable_timing=True)
-                end_event = torch.cuda.Event(enable_timing=True)
-                start_event.record()
-                result = operation()
-                end_event.record()
-                torch.cuda.synchronize()
-                elapsed_ms = start_event.elapsed_time(end_event)
+                # Run the actual op with GPU timing.  Compute stays on the
+                # GPU; only random generation is redirected to the CPU.
+                operation = op_def.factory(self, size)
+                with torch.cuda.device(gpu_id):
+                    start_event = torch.cuda.Event(enable_timing=True)
+                    end_event = torch.cuda.Event(enable_timing=True)
+                    start_event.record()
+                    result = operation()
+                    end_event.record()
+                    torch.cuda.synchronize()
+                    elapsed_ms = start_event.elapsed_time(end_event)
 
-                if isinstance(result, torch.Tensor):
-                    return (result.cpu(), input_hash, elapsed_ms)
-                return (result, input_hash, elapsed_ms)
+                    if isinstance(result, torch.Tensor):
+                        return (result.cpu(), input_hash, elapsed_ms)
+                    return (result, input_hash, elapsed_ms)
         except RuntimeError as e:
             if "out of memory" in str(e):
                 logger.warning(f"  GPU {gpu_id}: OOM - skipping")
@@ -250,6 +267,67 @@ class CrossGPUDetector:
             f"max_diff={max_diff:.2e}, {mismatches}/{total} mismatched)"
         )
 
+    # Cross-architecture peers run different kernel selections and
+    # accumulation orders, so bit-exact output agreement cannot hold even
+    # on fault-free hardware.  Heterogeneous pairs fall back to tolerances
+    # (mirroring the self-mode oracle defaults, keyed by precision mode);
+    # same-model pairs keep the strict bit-exact semantics.
+    _HETERO_TOL = {
+        "fp32": (1e-3, 1e-3),
+        "tf32": (1e-2, 1e-2),
+        "fp16": (1e-2, 1e-2),
+        "bf16": (1e-1, 1e-1),
+        "fp8": (5e-1, 5e-1),
+    }
+
+    def _gpu_model(self, gpu_id: int) -> Optional[str]:
+        """Device model name, or None when unavailable (CPU-only tests)."""
+        if self._models_cache is None:
+            models = {}
+            for g in self.gpu_ids:
+                try:
+                    models[g] = torch.cuda.get_device_name(g)
+                except Exception:
+                    models[g] = None
+            self._models_cache = models
+        return self._models_cache.get(gpu_id)
+
+    def _hetero_tolerance(self, ref_gpu: int, gpu_id: int):
+        """(atol, rtol) when the pair is heterogeneous, else None."""
+        m_ref, m_other = self._gpu_model(ref_gpu), self._gpu_model(gpu_id)
+        if m_ref is None or m_other is None or m_ref == m_other:
+            return None
+        tol = self._HETERO_TOL.get(
+            getattr(self, "_current_pmode", "fp32"), (1e-3, 1e-3)
+        )
+        log_key = (ref_gpu, gpu_id, m_ref, m_other, tol)
+        if log_key not in self._hetero_logged:
+            logger.warning(
+                f"Heterogeneous pair GPU {ref_gpu} ({m_ref}) vs GPU {gpu_id} "
+                f"({m_other}): tolerance compare atol={tol[0]:g} "
+                f"rtol={tol[1]:g} instead of bit-exact"
+            )
+            self._hetero_logged.add(log_key)
+        return tol
+
+    @staticmethod
+    def _within_tolerance(
+        a: torch.Tensor, b: torch.Tensor, atol: float, rtol: float
+    ) -> bool:
+        """NaN/Inf-pattern-aware tolerance comparison (mirrors the L2 oracle)."""
+        nan_a, nan_b = torch.isnan(a), torch.isnan(b)
+        inf_a, inf_b = torch.isinf(a), torch.isinf(b)
+        if not torch.equal(nan_a, nan_b) or not torch.equal(inf_a, inf_b):
+            return False
+        if inf_a.any() and not torch.equal(a[inf_a], b[inf_b]):
+            return False
+        finite = ~nan_a & ~inf_a
+        if not finite.any():
+            return True
+        diff = (a[finite].float() - b[finite].float()).abs()
+        tol = atol + rtol * b[finite].float().abs().max().item()
+        return bool((diff <= tol).all().item())
+
     def _compare_cross_gpu(
         self,
         op_name: str,
@@ -304,7 +382,14 @@ class CrossGPUDetector:
                 all_match = False
                 continue
 
-            if not self._nan_aware_equal(ref, output):
+            tol = self._hetero_tolerance(ref_gpu, gpu_id)
+            if tol is not None:
+                if not self._within_tolerance(ref, output, *tol):
+                    self._report_mismatch(
+                        ref_gpu, gpu_id, op_name, ref, output, verbose
+                    )
+                    all_match = False
+            elif not self._nan_aware_equal(ref, output):
                 self._report_mismatch(ref_gpu, gpu_id, op_name, ref, output, verbose)
                 all_match = False
 
@@ -462,6 +547,9 @@ class CrossGPUDetector:
         self._run_total_mismatched = 0
         self._run_total_elements = 0
         self._all_peers_disagree = False
+        self._hetero_logged = set()
+        self._models_cache = None
+        self._current_pmode = "fp32"
         total = 0
         passed = 0
         stopped = False
@@ -485,6 +573,7 @@ class CrossGPUDetector:
                 if stopped:
                     break
                 set_precision_mode(pmode)
+                self._current_pmode = pmode
                 mode_dtype = resolve_dtype(pmode)
                 pmode_label = pmode.upper()
 
@@ -571,6 +660,7 @@ class CrossGPUDetector:
                     if stopped:
                         break
                     set_precision_mode(pmode)
+                    self._current_pmode = pmode
                     mode_dtype = resolve_dtype(pmode)
                     self.current_dtype = (
                         mode_dtype
