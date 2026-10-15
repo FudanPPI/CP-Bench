@@ -69,6 +69,80 @@ PRESETS = {
 }
 
 
+def _log_provenance(args) -> dict:
+    """Log and return environment provenance for this run.
+
+    Cross-fleet result comparison requires knowing exactly what produced
+    them: library versions, device identities and the exact CP-Bench
+    revision.  The returned dict is embedded in --json-out reports.
+    """
+    import platform
+    import subprocess
+
+    import torch
+
+    commit = None
+    try:
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        commit = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=repo_root, capture_output=True, text=True, timeout=5,
+        ).stdout.strip() or None
+    except Exception:
+        pass
+    info = {
+        "python": platform.python_version(),
+        "torch": torch.__version__,
+        "cuda": torch.version.cuda,
+        "cudnn": (torch.backends.cudnn.version()
+                  if torch.backends.cudnn.is_available() else None),
+        "cpbench_commit": commit,
+        "gpus": [
+            {
+                "id": i,
+                "name": torch.cuda.get_device_name(i),
+                "capability": ".".join(
+                    map(str, torch.cuda.get_device_capability(i))
+                ),
+            }
+            for i in range(torch.cuda.device_count())
+        ],
+        "argv": list(sys.argv),
+    }
+    logger.info(
+        "provenance: python=%s torch=%s cuda=%s cudnn=%s cpbench=%s gpus=%s",
+        info["python"], info["torch"], info["cuda"], info["cudnn"],
+        info["cpbench_commit"] or "unknown",
+        ", ".join(g["name"] for g in info["gpus"]) or "none",
+    )
+    return info
+
+
+def _write_json_report(args, provenance, sink, rc) -> None:
+    """Write the machine-readable run report when --json-out is given.
+
+    Automation (fleet dashboards, trend analysis, CI gates) consumes this
+    instead of parsing human logs.  A failed report write is logged as an
+    error but does not change the detection exit code.
+    """
+    import json
+
+    payload = {
+        "schema": "cpbench-run-report/1",
+        "mode": sink.get("mode"),
+        "exit_code": rc,
+        "provenance": provenance,
+        "args": dict(vars(args)),
+        "results": sink.get("results"),
+    }
+    try:
+        with open(args.json_out, "w") as f:
+            json.dump(payload, f, indent=2, default=str)
+        logger.info(f"JSON report written to {args.json_out}")
+    except OSError as e:
+        logger.error(f"failed to write JSON report to {args.json_out}: {e}")
+
+
 def _parse_sizes(sizes_str):
     """Parse comma-separated size specs like '4096x4096,14000x14000'."""
     sizes = []
@@ -166,7 +240,7 @@ def _random_warmup(gpu_ids, test_sizes, element_size=4):
     return held_tensors
 
 
-def _sweep_cross_gpu(args, preset=None):
+def _sweep_cross_gpu(args, preset=None, sink=None):
     """Run cross-GPU operator tests with systematic HBM coverage.
 
     Staircase approach — progressively fills GPU memory, testing each new
@@ -205,7 +279,7 @@ def _sweep_cross_gpu(args, preset=None):
             test_sizes = cfg["sizes"]
         if categories is None:
             categories = cfg["categories"]
-        hash_inputs = hash_inputs or cfg["hash_inputs"]
+        hash_inputs = args.hash_inputs
         run_pipelines = run_pipelines or cfg["pipelines"]
 
     gpu_ids = _get_gpu_ids()
@@ -342,10 +416,18 @@ def _sweep_cross_gpu(args, preset=None):
     del held_chunks
     torch.cuda.empty_cache()
 
+    if sink is not None:
+        sink["mode"] = "sweep"
+        sink["results"] = {
+            "sweep_regions": actual_regions,
+            "total_passed": overall_passed,
+            "total_failed": overall_failed,
+        }
+
     return 1 if overall_failed > 0 else 0
 
 
-def _run_self_mode(args, fallback: bool = False):
+def _run_self_mode(args, fallback: bool = False, sink=None):
     """Run self-consistency testing on each GPU in parallel.
 
     fallback=True marks results reached via the single-GPU fallback from
@@ -439,10 +521,14 @@ def _run_self_mode(args, fallback: bool = False):
             r["mode"] = "self-fallback-from-cross-gpu"
         print(f"\nResult (GPU {r['gpu_id']}): {r}")
 
+    if sink is not None:
+        sink["mode"] = "self-fallback-from-cross-gpu" if fallback else "self"
+        sink["results"] = all_results
+
     return overall_rc
 
 
-def _run_cross_gpu_mode(args, preset=None):
+def _run_cross_gpu_mode(args, preset=None, sink=None):
     """Run cross-GPU operator comparison."""
     from .cross_gpu import CrossGPUDetector
 
@@ -463,7 +549,7 @@ def _run_cross_gpu_mode(args, preset=None):
             test_sizes = cfg["sizes"]
         if categories is None:
             categories = cfg["categories"]
-        hash_inputs = hash_inputs or cfg["hash_inputs"]
+        hash_inputs = args.hash_inputs
         run_pipelines = run_pipelines or cfg["pipelines"]
 
     # Determine GPUs
@@ -499,7 +585,7 @@ def _run_cross_gpu_mode(args, preset=None):
             args.categories = ",".join(categories)
         args.hash_inputs = hash_inputs
         args.pipelines = run_pipelines
-        return _run_self_mode(args, fallback=True)
+        return _run_self_mode(args, fallback=True, sink=sink)
 
     dtypes = [d.strip() for d in args.dtypes.split(",")]
 
@@ -530,6 +616,10 @@ def _run_cross_gpu_mode(args, preset=None):
     torch.cuda.empty_cache()
 
     print(f"\nResult: {result}")
+
+    if sink is not None:
+        sink["mode"] = "cross-gpu"
+        sink["results"] = result
 
     return 1 if result["failed"] > 0 else 0
 
@@ -676,10 +766,12 @@ examples:
     # Cross-GPU specific
     parser.add_argument(
         "--hash-inputs",
-        action="store_true",
-        default=False,
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="Hash input tensors to distinguish memory vs compute corruption "
-        "(cross-gpu mode only)",
+        "(cross-gpu mode only; default: on -- inputs are cheap to hash and "
+        "the comparison premise is worth verifying on every run; disable "
+        "with --no-hash-inputs)",
     )
     parser.add_argument(
         "--fail-fast",
@@ -749,6 +841,15 @@ examples:
         "Useful for capping run time in automated pipelines.",
     )
     parser.add_argument(
+        "--json-out",
+        type=str,
+        default=None,
+        help="Write a machine-readable run report (JSON) to this path: "
+        "mode, exit code, environment provenance, effective args and "
+        "per-GPU results. Intended for automation; human logs remain "
+        "unchanged.",
+    )
+    parser.add_argument(
         "--list-ops",
         "--list_ops",
         action="store_true",
@@ -768,6 +869,8 @@ examples:
     # Set CUBLAS workspace config for deterministic mode
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
+    provenance = _log_provenance(args)
+
     _resolve_precision_modes(args, parser)
 
     mode, preset = _resolve_mode_preset(args.mode, args.preset)
@@ -785,14 +888,15 @@ examples:
         args.iterations = 3
 
     # Dispatch
+    sink = {}
     ran_cross_gpu = False
     if mode == "self":
-        rc = _run_self_mode(args)
+        rc = _run_self_mode(args, sink=sink)
     elif mode == "cross-gpu":
-        rc = _run_cross_gpu_mode(args, preset=preset)
+        rc = _run_cross_gpu_mode(args, preset=preset, sink=sink)
         ran_cross_gpu = True
     elif mode == "sweep":
-        rc = _sweep_cross_gpu(args, preset=preset)
+        rc = _sweep_cross_gpu(args, preset=preset, sink=sink)
     else:
         print(f"Unknown mode: {mode}", file=sys.stderr)
         rc = 1
@@ -812,6 +916,10 @@ examples:
         args.pipelines = False
         sweep_rc = _sweep_cross_gpu(args, preset=None)
         rc = max(rc, sweep_rc)
+
+    if args.json_out:
+        sink.setdefault("mode", mode)
+        _write_json_report(args, provenance, sink, rc)
 
     sys.exit(rc)
 

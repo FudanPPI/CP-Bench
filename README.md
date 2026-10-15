@@ -4,7 +4,7 @@ CP-Bench, stands for Configurable and Paramraterizable PyTorch-level Test Benchm
 
 ## Features
 
-* **GPU Silent Data Corruption Detection**: CP-Bench uses **PyTorch's deterministic running** to detect silent data corruption on GPUs, which can cause incorrect results without raising any hardware alerts.
+* **GPU Silent Data Corruption Detection**: CP-Bench detects silent data corruption on GPUs — incorrect results produced without any hardware alert — using **layered detection**: (1) *replication* (deterministic repeated runs compared bit-exactly), which catches non-deterministic faults, and (2) a *CPU-fp64 oracle* (the same operator recomputed on the CPU in double precision on bitwise-identical inputs), which catches **deterministic** corruption that replication alone is structurally blind to. Repetition-based self-consistency by design cannot tell "correctly consistent" from "consistently wrong"; the oracle layer closes that gap. Ops that cannot run on the CPU are reported as `oracle_unavailable` instead of being silently covered by replication only.
 * **Operator-Level SDC Detection**: In addition to model-level testing, CP-Bench can run individual PyTorch operators (matmul, attention, normalization, etc.) and compare their outputs across GPUs to pinpoint which GPU is producing corrupt results.
 * **Different Running Modes**: CP-Bench supports distributed mode, as well as concurrent modes, to support SDC check across hosts and GPUs.
 * **Stress Testing**: The benchmark includes adaptive PyTorch workloads to stress test GPUs, identifying potential performance bottlenecks and stability issues.
@@ -99,7 +99,9 @@ export NCCL_DEBUG=0 && export CUBLAS_WORKSPACE_CONFIG=:4096:8 && python run_benc
 
 ## Operator-Level SDC Detection
 
-Besides the model-level tests above, CP-Bench also provides an operator-level test that runs individual PyTorch operators (e.g., matmul, attention, normalization, convolution, backward pass) and compares their outputs across all GPUs on the host. Because every GPU runs the same operator with the same deterministic inputs, any disagreement points directly to the faulty GPU. This complements model-level testing by isolating SDC at the operator granularity.
+Besides the model-level tests above, CP-Bench also provides an operator-level test that runs individual PyTorch operators (e.g., matmul, attention, normalization, convolution, backward pass) and compares their outputs across GPUs. All peers consume bitwise-identical inputs (generated once on the CPU and moved to each device), so any disagreement points directly to the faulty GPU; on same-model GPUs the comparison is bit-exact, while heterogeneous pairs automatically fall back to tolerance comparison. On single-GPU hosts the mode falls back to self-consistency with the CPU-fp64 oracle, and the fallback is reported explicitly in both logs and results. This complements model-level testing by isolating SDC at the operator granularity.
+
+> **Fault-model note**: replication-based self-consistency only detects *non-deterministic* faults. A persistent (deterministic) hardware fault produces the same wrong output on every run and passes replication; the CPU-fp64 oracle layer (enabled by default, `--no-oracle` to disable) is what catches it. See the `deterministic_sdc` vs `ops_failed` counters in the run output.
 
 You can launch the operator-level test through the same entry point using the `--test operator` option:
 ```
