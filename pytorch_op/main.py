@@ -329,6 +329,7 @@ def _sweep_cross_gpu(args, preset=None, sink=None):
             gpu_ids=gpu_ids,
             test_sizes=test_sizes,
             hash_inputs=hash_inputs,
+            seed=args.seed,
         )
 
         result = detector.run(
@@ -459,6 +460,8 @@ def _run_self_mode(args, fallback: bool = False, sink=None):
             run_oracle=args.run_oracle,
             oracle_rtol=args.oracle_rtol,
             oracle_atol=args.oracle_atol,
+            seed=args.seed,
+            calibrate=args.calibrate,
         )
         try:
             result = detector.run_all_tests(
@@ -715,6 +718,20 @@ examples:
         help="Iterations per op (default: 1 for cross-gpu, 3 for self)",
     )
     parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="RNG seed for single-source inputs and deterministic runs "
+        "(default: 42)",
+    )
+    parser.add_argument(
+        "--calibrate",
+        action="store_true",
+        help="Self mode only: one fault-free pass reporting per-op CPU-fp64 "
+        "vs GPU-fp32 baseline error and headroom against oracle tolerance "
+        "(report-only; tolerance is never auto-adjusted)",
+    )
+    parser.add_argument(
         "--sizes",
         type=str,
         default=None,
@@ -886,6 +903,14 @@ examples:
     # Set self-mode default iterations if not explicitly changed
     if mode == "self" and args.iterations == 1:
         args.iterations = 3
+
+    # Calibration is an L2 oracle workflow; cross-gpu/sweep have no oracle.
+    if args.calibrate and mode != "self":
+        logger.warning(
+            "--calibrate is supported in self mode only; ignoring for "
+            f"{mode} mode"
+        )
+        args.calibrate = False
 
     # Dispatch
     sink = {}

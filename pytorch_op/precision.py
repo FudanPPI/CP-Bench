@@ -70,13 +70,12 @@ def resolve_dtype(precision_mode: str) -> torch.dtype:
     return PRECISION_MODE_DTYPE.get(precision_mode, torch.float32)
 
 
-def enable_deterministic_mode() -> None:
+def enable_deterministic_mode(seed: int = 42) -> None:
     """Enable deterministic settings for reproducible results.
 
     Sets seeds and forces deterministic algorithms. Does NOT configure
     precision -- use set_precision_mode() for that.
     """
-    seed = 42
     torch.manual_seed(seed)
     random.seed(seed)
     try:

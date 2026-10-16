@@ -47,12 +47,14 @@ class CrossGPUDetector:
         gpu_ids: List[int],
         test_sizes=None,
         hash_inputs: bool = False,
+        seed: int = 42,
     ):
         self.gpu_ids = gpu_ids
         self._test_sizes = test_sizes or DEFAULT_SIZES
         self.current_dtype = torch.float32
         self._failures: List[str] = []
         self._hash_inputs = hash_inputs
+        self.seed = seed
         self._gpu_disagreements: Dict[int, Set[int]] = {g: set() for g in gpu_ids}
         self.device: str = f"cuda:{gpu_ids[0]}"
         self._gpu_serials: Dict[int, str] = self._get_gpu_serials()
@@ -151,14 +153,14 @@ class CrossGPUDetector:
         """Run a single op on a specific GPU and return (result_on_cpu, input_hash, elapsed_ms)."""
         self.device = f"cuda:{gpu_id}"
         try:
-            enable_deterministic_mode()
+            enable_deterministic_mode(self.seed)
             # Single-source inputs: every random draw -- the hashed first
             # tensor AND factory-internal weight/index/mask draws -- is
             # generated on the CPU and moved to this GPU under one seed,
             # so all peers consume bitwise-identical inputs by
             # construction (closes D3's input premise; peers run
             # sequentially, so the global CPU RNG is not raced).
-            with _deterministic_rng():
+            with _deterministic_rng(self.seed):
                 input_tensor = self.create_test_tensor(size)
                 input_hash = (
                     self._hash_tensor(input_tensor)
@@ -530,6 +532,7 @@ class CrossGPUDetector:
 
         logger.info(f"Cross-GPU SDC detection on GPUs: {self.gpu_ids}")
         logger.info(f"Iterations per op: {iterations}")
+        logger.info(f"Seed: {self.seed}")
         logger.info(f"Dtypes: {dtypes}")
         logger.info(f"Precision modes: {precision_modes}")
         logger.info(f"Sizes: {self._test_sizes}")
@@ -679,7 +682,7 @@ class CrossGPUDetector:
                             for gpu_id in self.gpu_ids:
                                 self.device = f"cuda:{gpu_id}"
                                 try:
-                                    enable_deterministic_mode()
+                                    enable_deterministic_mode(self.seed)
                                     set_precision_mode(pmode)
                                     operation = pipeline_def.factory(
                                         self, pipeline_size

@@ -89,6 +89,11 @@ def _deterministic_rng(seed: int = 42):
             setattr(torch, name, fn)
 
 
+# --calibrate warns when fault-free baseline error sits within this factor
+# of the effective oracle tolerance (false-SSC risk on other GPUs/builds).
+CALIBRATE_HEADROOM_WARN = 4.0
+
+
 class GPUSDCDetector:
     """Detects Silent Data Corruption by checking op determinism on GPU."""
 
@@ -108,6 +113,8 @@ class GPUSDCDetector:
         run_oracle: bool = True,
         oracle_rtol: float = 1e-3,
         oracle_atol: float = 1e-3,
+        seed: int = 42,
+        calibrate: bool = False,
     ):
         self.gpu_id = gpu_id
         self.num_iterations = num_iterations
@@ -116,9 +123,12 @@ class GPUSDCDetector:
         self.run_oracle = run_oracle
         self.oracle_rtol = oracle_rtol
         self.oracle_atol = oracle_atol
+        self.seed = seed
+        self.calibrate = calibrate
         self._failed_operations: List[str] = []
         self._oracle_failed: List[str] = []
         self._oracle_unavailable: List[str] = []
+        self._calibration_records: List[dict] = []
         self._test_sizes = test_sizes or self.DEFAULT_SIZES
 
     def create_test_tensor(
@@ -134,7 +144,7 @@ class GPUSDCDetector:
         oracle consumes the same values instead of a fresh fp64 sequence.
         """
         dtype = dtype or self.current_dtype
-        torch.manual_seed(42)
+        torch.manual_seed(self.seed)
         return torch.randn(shape, dtype=torch.float32, device="cpu").to(
             dtype=dtype, device=self.device
         )
@@ -252,11 +262,18 @@ class GPUSDCDetector:
             f"Testing GPU {self.gpu_id}: {torch.cuda.get_device_name(self.gpu_id)}"
         )
         logger.info(f"Iterations per operation: {self.num_iterations}")
+        if self.calibrate:
+            logger.info(
+                "CALIBRATION MODE: one fault-free pass per op measuring "
+                "CPU-fp64 vs GPU-fp32 baseline error; oracle tolerances are "
+                "reported, never auto-adjusted"
+            )
 
         start_time = time.time()
         self._failed_operations = []
         self._oracle_failed = []
         self._oracle_unavailable = []
+        self._calibration_records = []
 
         total_ops, passed_ops = self._run_op_tests(categories, resolved_dtypes)
 
@@ -267,7 +284,10 @@ class GPUSDCDetector:
             passed_ops += pipe_passed
 
         elapsed = time.time() - start_time
-        self._log_results(total_ops, elapsed)
+        if self.calibrate:
+            self._log_calibration_summary()
+        else:
+            self._log_results(total_ops, elapsed)
 
         return {
             "ops_total": total_ops,
@@ -278,12 +298,64 @@ class GPUSDCDetector:
             "oracle_failed_operations": list(self._oracle_failed),
             "oracle_unavailable": len(self._oracle_unavailable),
             "oracle_unavailable_operations": list(self._oracle_unavailable),
+            "seed": self.seed,
+            "calibrate": self.calibrate,
+            "calibration": list(self._calibration_records),
             "elapsed_seconds": round(elapsed, 2),
         }
 
+    def _log_calibration_summary(self):
+        """Log per-op baseline headroom measured by --calibrate.
+
+        Headroom = effective tolerance / fault-free baseline max abs diff.
+        Ops below CALIBRATE_HEADROOM_WARN risk false SDC verdicts on other
+        GPUs/torch builds; the operator should raise --oracle-rtol/--oracle-atol.
+        """
+        numeric = [
+            r for r in self._calibration_records
+            if r.get("status") in ("within", "exceeds")
+        ]
+        n_exceeds = sum(1 for r in numeric if r["status"] == "exceeds")
+        n_within = len(numeric) - n_exceeds
+        n_unavailable = sum(
+            1 for r in self._calibration_records if r.get("status") == "unavailable"
+        )
+        headrooms = [r["headroom"] for r in numeric if r.get("headroom")]
+        tight = [
+            r for r in numeric
+            if r.get("headroom") is not None
+            and r["status"] == "within"
+            and r["headroom"] < CALIBRATE_HEADROOM_WARN
+        ]
+        logger.info(
+            f"CALIBRATION SUMMARY: {len(numeric)} op(s) measured "
+            f"({n_within} within tolerance, {n_exceeds} exceed"
+            f"{f', {n_unavailable} oracle-unavailable' if n_unavailable else ''})"
+        )
+        if headrooms:
+            logger.info(
+                f"  min headroom {min(headrooms):.1f}x "
+                f"(warn threshold {CALIBRATE_HEADROOM_WARN:.0f}x)"
+            )
+        for r in [r for r in numeric if r["status"] == "exceeds"]:
+            logger.warning(
+                f"  [exceeds] {r['op_name']} ({r['dtype']} {r['size']}): "
+                f"baseline {r['baseline_max_diff']:.3g} > tol {r['tol']:.3g}"
+            )
+        for r in tight:
+            logger.warning(
+                f"  [tight]   {r['op_name']} ({r['dtype']} {r['size']}): "
+                f"headroom {r['headroom']:.1f}x"
+            )
+        if n_exceeds or tight:
+            logger.warning(
+                "  raise --oracle-rtol/--oracle-atol before trusting SDC "
+                "verdicts; calibration never loosens tolerance automatically"
+            )
+
     def _enable_deterministic_mode(self):
         """Enable deterministic settings for reproducible results."""
-        seed = 42
+        seed = self.seed
         torch.manual_seed(seed)
         random.seed(seed)
         np.random.seed(seed)
@@ -313,9 +385,13 @@ class GPUSDCDetector:
         size: Optional[Tuple[int, int]] = None,
     ) -> bool:
         """Test an operation: L1 replication + optional L2 CPU-fp64 oracle."""
+        if self.calibrate:
+            return self._calibrate_operation(
+                op_name, operation, oracle_factory, size
+            )
         try:
             outputs = []
-            with _deterministic_rng():
+            with _deterministic_rng(self.seed):
                 for _ in range(self.num_iterations):
                     self._enable_deterministic_mode()
                     output = self._run_operation_on_gpu(operation)
@@ -348,11 +424,35 @@ class GPUSDCDetector:
         recomputation is an independent oracle.  Ops whose factories cannot
         run on CPU are reported as oracle-unavailable, not as failures.
         """
+        result = self._oracle_compare(op_name, factory, size, gpu_output)
+        if result is None:
+            return True
+        if result["sdc"]:
+            self._oracle_failed.append(op_name)
+            return False
+        return True
+
+    def _oracle_compare(
+        self,
+        op_name: str,
+        factory: Callable,
+        size: Tuple[int, int],
+        gpu_output: torch.Tensor,
+        log_verdict: bool = True,
+    ) -> Optional[dict]:
+        """Compare one GPU output against the CPU-fp64 oracle.
+
+        Returns None when the op has no CPU oracle (unavailable); otherwise
+        a dict: sdc, reason, baseline_max_diff, tol, mismatches, numel.
+        ``log_verdict=False`` suppresses SDC/PASS verdict logs, used by
+        --calibrate where the same comparison is a baseline measurement.
+        """
         shadow = GPUSDCDetector(
             gpu_id=self.gpu_id,
             num_iterations=1,
             test_sizes=[size],
             run_oracle=False,
+            seed=self.seed,
         )
         shadow.device = "cpu"
         shadow.current_dtype = torch.float64
@@ -360,7 +460,7 @@ class GPUSDCDetector:
             # No torch.no_grad() here: backward_pass ops legitimately call
             # .backward() inside the factory, which cannot build a graph
             # under no_grad.
-            with _deterministic_rng():
+            with _deterministic_rng(self.seed):
                 operation = factory(shadow, size)
                 golden = operation()
             golden = golden.detach().to(torch.float64).cpu()
@@ -369,35 +469,52 @@ class GPUSDCDetector:
                 f"ORACLE UNAVAILABLE in {op_name}: {type(e).__name__}: {e}"
             )
             self._oracle_unavailable.append(op_name)
-            return True
+            return None
 
         out = gpu_output.detach().to(torch.float64).cpu()
         if out.shape != golden.shape:
-            logger.error(
-                f"DETERMINISTIC SDC (oracle) in {op_name}: shape mismatch "
-                f"{tuple(out.shape)} vs {tuple(golden.shape)}"
-            )
-            self._oracle_failed.append(op_name)
-            return False
+            if log_verdict:
+                logger.error(
+                    f"DETERMINISTIC SDC (oracle) in {op_name}: shape mismatch "
+                    f"{tuple(out.shape)} vs {tuple(golden.shape)}"
+                )
+            return {
+                "sdc": True, "reason": "shape mismatch",
+                "baseline_max_diff": None, "tol": None,
+                "mismatches": None, "numel": None,
+            }
         if out.numel() == 0:
-            logger.info(f"ORACLE PASS {op_name} (empty output)")
-            return True
+            if log_verdict:
+                logger.info(f"ORACLE PASS {op_name} (empty output)")
+            return {
+                "sdc": False, "reason": "empty",
+                "baseline_max_diff": 0.0, "tol": self.oracle_atol,
+                "mismatches": 0, "numel": 0,
+            }
         nan_out, nan_gold = torch.isnan(out), torch.isnan(golden)
         inf_out, inf_gold = torch.isinf(out), torch.isinf(golden)
         if not torch.equal(nan_out, nan_gold) or not torch.equal(inf_out, inf_gold):
-            logger.error(
-                f"DETERMINISTIC SDC (oracle) in {op_name}: "
-                f"NaN/Inf pattern differs from the fp64 reference"
-            )
-            self._oracle_failed.append(op_name)
-            return False
+            if log_verdict:
+                logger.error(
+                    f"DETERMINISTIC SDC (oracle) in {op_name}: "
+                    f"NaN/Inf pattern differs from the fp64 reference"
+                )
+            return {
+                "sdc": True, "reason": "nan_inf pattern",
+                "baseline_max_diff": None, "tol": None,
+                "mismatches": None, "numel": None,
+            }
         if inf_out.any() and not torch.equal(out[inf_out], golden[inf_gold]):
-            logger.error(
-                f"DETERMINISTIC SDC (oracle) in {op_name}: "
-                f"Inf sign differs from the fp64 reference"
-            )
-            self._oracle_failed.append(op_name)
-            return False
+            if log_verdict:
+                logger.error(
+                    f"DETERMINISTIC SDC (oracle) in {op_name}: "
+                    f"Inf sign differs from the fp64 reference"
+                )
+            return {
+                "sdc": True, "reason": "inf sign",
+                "baseline_max_diff": None, "tol": None,
+                "mismatches": None, "numel": None,
+            }
         finite = ~nan_out & ~inf_out
         max_diff, mismatches = 0.0, 0
         tol = self.oracle_atol
@@ -407,15 +524,97 @@ class GPUSDCDetector:
             tol = (self.oracle_atol
                    + self.oracle_rtol * golden[finite].abs().max().item())
             mismatches = int((diff > tol).sum().item())
-        if max_diff > tol:
-            logger.error(
-                f"DETERMINISTIC SDC (oracle) in {op_name}: "
-                f"max abs diff {max_diff:.6g} > tolerance {tol:.6g}, "
-                f"mismatched={mismatches}/{int(finite.sum().item())}"
+        sdc = max_diff > tol
+        if log_verdict:
+            if sdc:
+                logger.error(
+                    f"DETERMINISTIC SDC (oracle) in {op_name}: "
+                    f"max abs diff {max_diff:.6g} > tolerance {tol:.6g}, "
+                    f"mismatched={mismatches}/{int(finite.sum().item())}"
+                )
+            else:
+                logger.info(f"ORACLE PASS {op_name} (max abs diff {max_diff:.6g})")
+        return {
+            "sdc": sdc, "reason": None,
+            "baseline_max_diff": max_diff, "tol": tol,
+            "mismatches": mismatches, "numel": int(finite.sum().item()),
+        }
+
+    def _calibrate_operation(
+        self,
+        op_name: str,
+        operation: Callable,
+        oracle_factory: Optional[Callable],
+        size: Optional[Tuple[int, int]],
+    ) -> bool:
+        """--calibrate: measure one fault-free run's baseline oracle error.
+
+        Never adjusts tolerance; records per-op baseline/headroom for the
+        report so operators can size --oracle-rtol/--oracle-atol before a
+        detection run.  Always returns True: calibration is not a verdict.
+        """
+        dtype_label = str(self.current_dtype).split(".")[-1]
+        record = {
+            "op_name": op_name,
+            "dtype": dtype_label,
+            "size": list(size) if size is not None else None,
+        }
+        try:
+            with _deterministic_rng(self.seed):
+                self._enable_deterministic_mode()
+                gpu_output = self._run_operation_on_gpu(operation)
+        except Exception as e:
+            logger.warning(f"CALIBRATE SKIP {op_name}: {type(e).__name__}: {e}")
+            record.update(status="error", reason=str(e))
+            self._calibration_records.append(record)
+            return True
+
+        if oracle_factory is None:
+            logger.info(f"CALIBRATE {op_name}: no oracle available")
+            record.update(status="no_oracle")
+            self._calibration_records.append(record)
+            return True
+
+        result = self._oracle_compare(
+            op_name, oracle_factory, size, gpu_output, log_verdict=False
+        )
+        if result is None:
+            record.update(status="unavailable")
+            self._calibration_records.append(record)
+            return True
+
+        baseline = result["baseline_max_diff"]
+        tol = result["tol"]
+        record.update(
+            reason=result["reason"],
+            baseline_max_diff=baseline,
+            tol=tol,
+            mismatches=result["mismatches"],
+            numel=result["numel"],
+        )
+        if result["sdc"]:
+            record.update(status="exceeds", headroom=None)
+            logger.warning(
+                f"CALIBRATE {op_name} ({dtype_label} {size}): baseline "
+                f"{baseline:.3g} EXCEEDS tol {tol:.3g} "
+                f"(mismatched {result['mismatches']}/{result['numel']})"
             )
-            self._oracle_failed.append(op_name)
-            return False
-        logger.info(f"ORACLE PASS {op_name} (max abs diff {max_diff:.6g})")
+        else:
+            headroom = (tol / baseline) if baseline and baseline > 0 else None
+            record.update(status="within", headroom=headroom)
+            if headroom is not None and headroom < CALIBRATE_HEADROOM_WARN:
+                logger.warning(
+                    f"CALIBRATE {op_name} ({dtype_label} {size}): baseline "
+                    f"{baseline:.3g}, tol {tol:.3g}, headroom {headroom:.1f}x "
+                    f"TIGHT (<{CALIBRATE_HEADROOM_WARN:.0f}x)"
+                )
+            else:
+                hr_text = f"headroom {headroom:.1f}x" if headroom else "zero baseline"
+                logger.info(
+                    f"CALIBRATE {op_name} ({dtype_label} {size}): baseline "
+                    f"{baseline:.3g}, tol {tol:.3g}, {hr_text}"
+                )
+        self._calibration_records.append(record)
         return True
 
     def _compare_outputs(self, outputs: List[torch.Tensor], op_name: str) -> bool:
